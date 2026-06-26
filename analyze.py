@@ -50,7 +50,7 @@ def parse_typed_output(script):
         return None
 
 def iter_typed(con, tag):
-    """Yield (height, time, txid, mine, fields) for every stored tx carrying `tag`,
+    """Yield (height, time, txid, mine, fields, owner_hex) for every stored tx carrying `tag`,
     parsed from txs.raw (joined to the block's timestamp). Yields nothing if raw isn't stored."""
     if "raw" not in {r[1] for r in con.execute("PRAGMA table_info(txs)")}: return
     rows = con.execute(
@@ -61,7 +61,7 @@ def iter_typed(con, tag):
             for o in bsv.Transaction.from_hex(raw).outputs:
                 r = parse_typed_output(o.locking_script.serialize())
                 if r and r[0] == tag:
-                    yield height, btime, txid, mine, r[1]; break
+                    yield height, btime, txid, mine, r[1], r[2].hex(); break
         except Exception:
             continue
 
@@ -70,7 +70,7 @@ def identity_saves(con):
     or None if no raw txs are stored (re-scan to populate txs.raw)."""
     if "raw" not in {r[1] for r in con.execute("PRAGMA table_info(txs)")}: return None
     out = []
-    for height, btime, txid, mine, f in iter_typed(con, "BSVP:ID:1"):
+    for height, btime, txid, mine, f, owner in iter_typed(con, "BSVP:ID:1"):
         if len(f) == 5 and len(f[0]) == 33:
             out.append((height, btime, txid, mine, f[0].hex(), f[1].hex(),
                         f[2].decode("utf-8", "replace"), f[3].decode("utf-8", "replace")))
@@ -78,23 +78,34 @@ def identity_saves(con):
 
 def games_list(con):
     """Reconstruct games from typed txs. GAME{tableId,gameId}, TBL{tableId,variant,seats,stakes},
-    HAND{gameId,handId,button}, BET{handId,...}. Returns (games_by_id, tables_by_id)."""
-    tables = {}
-    for _, _, _, _, f in iter_typed(con, "BSVP:TBL:1"):
+    HAND{gameId,handId,button}, BET{handId,...}. The on-chain tableId is always all-zero, so a
+    game's table (stakes/seats) is linked by FUNDING CLUSTER — every tx of one on-chain tape
+    (TBL→GAME→HAND→…) chains its funding, landing in one cluster. Returns (games_by_id, tables_by_cluster)."""
+    _, comps = cluster(con)
+    cl = {}                                              # txid -> cluster index
+    for i, g in enumerate(comps):
+        for t in g: cl[t] = i
+    who = {}                                             # owner pubkey -> pseudonym (game owner = player's Base ID)
+    for r in (identity_saves(con) or []):
+        who[r[4]] = r[6]                                 # idpub  -> pseudonym
+        who.setdefault(r[5], r[6])                       # attpub -> pseudonym (fallback)
+    tables = {}                                          # cluster index -> (variant, seats, stakes)
+    for _, _, txid, _, f, _ in iter_typed(con, "BSVP:TBL:1"):
         if len(f) >= 4:
-            tables[f[0].hex()] = (f[1][0] if f[1] else None, f[2][0] if f[2] else None,
-                                  int.from_bytes(f[3], "little") if f[3] else None)
+            tables[cl.get(txid)] = (f[1][0] if f[1] else None, f[2][0] if f[2] else None,
+                                    int.from_bytes(f[3], "little") if f[3] else None)
     games = {}
-    for height, btime, txid, mine, f in iter_typed(con, "BSVP:GAME:1"):
+    for height, btime, txid, mine, f, owner in iter_typed(con, "BSVP:GAME:1"):
         if len(f) >= 2:
-            games[f[1].hex()] = {"table": f[0].hex(), "height": height, "time": btime,
-                                 "txid": txid, "mine": mine, "hands": 0, "bets": 0}
+            games[f[1].hex()] = {"cluster": cl.get(txid), "height": height, "time": btime,
+                                 "txid": txid, "mine": mine, "hands": 0, "bets": 0,
+                                 "player": who.get(owner), "owner": owner}
     hand2game = {}
-    for height, btime, txid, mine, f in iter_typed(con, "BSVP:HAND:1"):
+    for height, btime, txid, mine, f, _ in iter_typed(con, "BSVP:HAND:1"):
         if len(f) >= 2:
             gid = f[0].hex(); hand2game[f[1].hex()] = gid
             if gid in games: games[gid]["hands"] += 1
-    for height, btime, txid, mine, f in iter_typed(con, "BSVP:BET:1"):
+    for height, btime, txid, mine, f, _ in iter_typed(con, "BSVP:BET:1"):
         if len(f) >= 1:
             gid = hand2game.get(f[0].hex())
             if gid in games: games[gid]["bets"] += 1
@@ -188,13 +199,14 @@ def main():
     else:
         yours = sum(g["mine"] for g in games.values())
         print(f"  total games: {len(games)}  (yours={yours}, other={len(games) - yours})")
-        print(f"  {'date (UTC)':16}  {'game id':12}  {'stakes':>6}  {'seats':>5}  {'hands':>5}  {'bets':>4}")
+        print(f"  {'date (UTC)':16}  {'game id':12}  {'player':17}  {'stakes':>6}  {'seats':>5}  {'hands':>5}  {'bets':>4}")
         for gid, g in sorted(games.items(), key=lambda kv: (kv[1]["height"], kv[0])):
-            tb = tables.get(g["table"])
+            tb = tables.get(g["cluster"])
             stakes = "?" if not tb or tb[2] is None else tb[2]
             seats = "?" if not tb or tb[1] is None else tb[1]
-            who = "yours" if g["mine"] else "other"
-            print(f"  {fmt_time(g['time']):16}  {gid[:12]}  {stakes:>6}  {seats:>5}  {g['hands']:>5}  {g['bets']:>4}  [{who}]")
+            tag = "yours" if g["mine"] else "other"
+            name = ("@" + g["player"]) if g["player"] else (g["owner"][:10] + "…?")
+            print(f"  {fmt_time(g['time']):16}  {gid[:12]}  {name[:17]:17}  {stakes:>6}  {seats:>5}  {g['hands']:>5}  {g['bets']:>4}  [{tag}]")
 
     print("\n--- on-chain identity saves (every BSVP:ID:1 registration) ---")
     saves = identity_saves(con)
