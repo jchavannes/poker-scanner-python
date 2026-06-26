@@ -4,10 +4,14 @@ how many distinct participants/games, and how much is yours vs. other wallets.
 
 Usage: python analyze.py [--db bsvp.db]
 """
-import argparse, sqlite3
+import argparse, sqlite3, datetime
 from collections import defaultdict
 
 import bsv
+
+def fmt_time(t):
+    if not t: return "-"
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 # The scanner stores the FULL raw tx for every marked tx (txs.raw), so any field-level
 # analysis parses straight from the DB — no network. Below: parse the typed PUSHDATA
@@ -45,26 +49,56 @@ def parse_typed_output(script):
             return marker.decode("ascii", "replace"), fields, data
         return None
 
-def identity_saves(con):
-    """Every BSVP:ID:1 save, parsed from the stored raw tx. Returns rows
-    (height, txid, mine, idpub, attpub, pseudonym, email), or None if no raw txs are stored
-    (DB scanned before raw capture — run: bsvp_scan.py --backfill-raw)."""
-    if "raw" not in {r[1] for r in con.execute("PRAGMA table_info(txs)")}: return None
-    rows = con.execute("SELECT height, txid, mine, raw FROM txs "
-                       "WHERE tags LIKE '%BSVP:ID:1%' AND raw IS NOT NULL ORDER BY height, txid").fetchall()
-    out = []
-    for height, txid, mine, raw in rows:
+def iter_typed(con, tag):
+    """Yield (height, time, txid, mine, fields) for every stored tx carrying `tag`,
+    parsed from txs.raw (joined to the block's timestamp). Yields nothing if raw isn't stored."""
+    if "raw" not in {r[1] for r in con.execute("PRAGMA table_info(txs)")}: return
+    rows = con.execute(
+        "SELECT t.height, b.time, t.txid, t.mine, t.raw FROM txs t JOIN blocks b ON b.height=t.height "
+        f"WHERE t.tags LIKE '%{tag}%' AND t.raw IS NOT NULL ORDER BY t.height, t.txid").fetchall()
+    for height, btime, txid, mine, raw in rows:
         try:
             for o in bsv.Transaction.from_hex(raw).outputs:
                 r = parse_typed_output(o.locking_script.serialize())
-                if r and r[0] == "BSVP:ID:1" and len(r[1]) == 5 and len(r[1][0]) == 33:
-                    f = r[1]
-                    out.append((height, txid, mine, f[0].hex(), f[1].hex(),
-                                f[2].decode("utf-8", "replace"), f[3].decode("utf-8", "replace")))
-                    break
+                if r and r[0] == tag:
+                    yield height, btime, txid, mine, r[1]; break
         except Exception:
             continue
+
+def identity_saves(con):
+    """Every BSVP:ID:1 save: (height, time, txid, mine, idpub, attpub, pseudonym, email),
+    or None if no raw txs are stored (re-scan to populate txs.raw)."""
+    if "raw" not in {r[1] for r in con.execute("PRAGMA table_info(txs)")}: return None
+    out = []
+    for height, btime, txid, mine, f in iter_typed(con, "BSVP:ID:1"):
+        if len(f) == 5 and len(f[0]) == 33:
+            out.append((height, btime, txid, mine, f[0].hex(), f[1].hex(),
+                        f[2].decode("utf-8", "replace"), f[3].decode("utf-8", "replace")))
     return out or None
+
+def games_list(con):
+    """Reconstruct games from typed txs. GAME{tableId,gameId}, TBL{tableId,variant,seats,stakes},
+    HAND{gameId,handId,button}, BET{handId,...}. Returns (games_by_id, tables_by_id)."""
+    tables = {}
+    for _, _, _, _, f in iter_typed(con, "BSVP:TBL:1"):
+        if len(f) >= 4:
+            tables[f[0].hex()] = (f[1][0] if f[1] else None, f[2][0] if f[2] else None,
+                                  int.from_bytes(f[3], "little") if f[3] else None)
+    games = {}
+    for height, btime, txid, mine, f in iter_typed(con, "BSVP:GAME:1"):
+        if len(f) >= 2:
+            games[f[1].hex()] = {"table": f[0].hex(), "height": height, "time": btime,
+                                 "txid": txid, "mine": mine, "hands": 0, "bets": 0}
+    hand2game = {}
+    for height, btime, txid, mine, f in iter_typed(con, "BSVP:HAND:1"):
+        if len(f) >= 2:
+            gid = f[0].hex(); hand2game[f[1].hex()] = gid
+            if gid in games: games[gid]["hands"] += 1
+    for height, btime, txid, mine, f in iter_typed(con, "BSVP:BET:1"):
+        if len(f) >= 1:
+            gid = hand2game.get(f[0].hex())
+            if gid in games: games[gid]["bets"] += 1
+    return games, tables
 
 
 def cluster(con):
@@ -147,19 +181,34 @@ def main():
     print(f"  chat (DM)     : {has('BSVP:DM:1')}")
     print(f"  node publishes: {has('BSVP:NODE:1')}")
 
+    print("\n--- games played (BSVP:GAME:1) ---")
+    games, tables = games_list(con)
+    if not games:
+        print("  (none — no raw txs stored? re-scan with bsvp_scan.py --range)")
+    else:
+        yours = sum(g["mine"] for g in games.values())
+        print(f"  total games: {len(games)}  (yours={yours}, other={len(games) - yours})")
+        print(f"  {'date (UTC)':16}  {'game id':12}  {'stakes':>6}  {'seats':>5}  {'hands':>5}  {'bets':>4}")
+        for gid, g in sorted(games.items(), key=lambda kv: (kv[1]["height"], kv[0])):
+            tb = tables.get(g["table"])
+            stakes = "?" if not tb or tb[2] is None else tb[2]
+            seats = "?" if not tb or tb[1] is None else tb[1]
+            who = "yours" if g["mine"] else "other"
+            print(f"  {fmt_time(g['time']):16}  {gid[:12]}  {stakes:>6}  {seats:>5}  {g['hands']:>5}  {g['bets']:>4}  [{who}]")
+
     print("\n--- on-chain identity saves (every BSVP:ID:1 registration) ---")
     saves = identity_saves(con)
     if saves is None:
         print("  (no raw txs stored — re-scan with bsvp_scan.py --range to populate txs.raw)")
     else:
-        distinct = len({r[3] for r in saves})
+        distinct = len({r[4] for r in saves})
         print(f"  identity saves: {len(saves)}   distinct Base ID keys: {distinct}  "
-              f"(yours={sum(r[2] for r in saves)}, other={sum(1 - r[2] for r in saves)} saves)")
-        print(f"  {'height':>7}  {'txid':12}  {'pseudonym':16}  {'email':26}  base-ID")
-        for height, txid, mine, idpub, attpub, pseudonym, email in saves:
+              f"(yours={sum(r[3] for r in saves)}, other={sum(1 - r[3] for r in saves)} saves)")
+        print(f"  {'date (UTC)':16}  {'txid':12}  {'pseudonym':16}  {'email':24}  base-ID")
+        for height, btime, txid, mine, idpub, attpub, pseudonym, email in saves:
             who = "yours" if mine else "other"
-            print(f"  {height:>7}  {txid[:12]}  @{(pseudonym or '?')[:15]:15}  "
-                  f"{(email or '-')[:26]:26}  {idpub[:16]}… [{who}]")
+            print(f"  {fmt_time(btime):16}  {txid[:12]}  @{(pseudonym or '?')[:15]:15}  "
+                  f"{(email or '-')[:24]:24}  {idpub[:16]}… [{who}]")
 
     print(f"\n--- timeline (marked txs per {a.buckets}-block bucket) ---")
     for h0, n in q(f"SELECT (height/{a.buckets})*{a.buckets} AS b, count(*) FROM txs GROUP BY b ORDER BY b"):

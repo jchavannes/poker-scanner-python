@@ -18,7 +18,7 @@ UA = b"/poker-scanner:0.1/"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS blocks(
   height INTEGER PRIMARY KEY, hash TEXT, size INTEGER, txcount INTEGER,
-  marked INTEGER, scanned_at INTEGER);
+  marked INTEGER, scanned_at INTEGER, time INTEGER);
 CREATE TABLE IF NOT EXISTS txs(
   txid TEXT PRIMARY KEY, height INTEGER, tags TEXT, mine INTEGER,
   n_in INTEGER, n_out INTEGER, size INTEGER, raw TEXT);
@@ -152,8 +152,9 @@ def scan_block(payload, height, bh_hex, prefixes, con):
                     pt, pv = _prevout(vin); rows.append((txid, i, pt, pv))
                 con.executemany("INSERT OR REPLACE INTO tx_inputs VALUES(?,?,?,?)", rows)
     if con is not None:
-        con.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?,?,?)",
-                    (height, bh_hex, len(payload), ntx, marked, int(time.time())))
+        block_time = struct.unpack_from("<I", payload, 68)[0]   # header timestamp (LE uint32)
+        con.execute("INSERT OR REPLACE INTO blocks VALUES(?,?,?,?,?,?,?)",
+                    (height, bh_hex, len(payload), ntx, marked, int(time.time()), block_time))
         con.commit()
     return marked, mine, other, tags, ntx
 
