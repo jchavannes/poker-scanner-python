@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS blocks(
   marked INTEGER, scanned_at INTEGER);
 CREATE TABLE IF NOT EXISTS txs(
   txid TEXT PRIMARY KEY, height INTEGER, tags TEXT, mine INTEGER,
-  n_in INTEGER, n_out INTEGER, size INTEGER);
+  n_in INTEGER, n_out INTEGER, size INTEGER, raw TEXT);
 CREATE TABLE IF NOT EXISTS tx_inputs(
   txid TEXT, vin INTEGER, prev_txid TEXT, prev_vout INTEGER,
   PRIMARY KEY(txid, vin));
@@ -144,8 +144,9 @@ def scan_block(payload, height, bh_hex, prefixes, con):
             is_mine = txid[:10] in prefixes
             mine += is_mine; other += (not is_mine)
             if con is not None:
-                con.execute("INSERT OR REPLACE INTO txs VALUES(?,?,?,?,?,?,?)",
-                            (txid, height, ",".join(tg), int(is_mine), len(tx.inputs), len(tx.outputs), len(raw)))
+                # store the FULL raw tx so any field-level analysis runs from the DB later
+                con.execute("INSERT OR REPLACE INTO txs VALUES(?,?,?,?,?,?,?,?)",
+                            (txid, height, ",".join(tg), int(is_mine), len(tx.inputs), len(tx.outputs), len(raw), raw.hex()))
                 rows = []
                 for i, vin in enumerate(tx.inputs):
                     pt, pv = _prevout(vin); rows.append((txid, i, pt, pv))
