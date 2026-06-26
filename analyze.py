@@ -76,6 +76,27 @@ def identity_saves(con):
                         f[2].decode("utf-8", "replace"), f[3].decode("utf-8", "replace")))
     return out or None
 
+def identity_names(con):
+    """pubkey hex -> pseudonym, for both the Base ID and attestation keys of every identity."""
+    m = {}
+    for r in (identity_saves(con) or []):
+        m[r[4]] = r[6]                                   # idpub  -> pseudonym
+        m.setdefault(r[5], r[6])                         # attpub -> pseudonym
+    return m
+
+def conversations(con):
+    """DM (BSVP:DM:1) sender->recipient counts. fields = [senderPub, recipientPub, index, ciphertext].
+    Returns (rows, total) where rows is [(from_label, to_label, count)] sorted by count desc."""
+    names = identity_names(con)
+    label = lambda pub: ("@" + names[pub]) if pub in names else (pub[:10] + "…?")
+    pair = defaultdict(int); total = 0
+    for height, btime, txid, mine, f, owner in iter_typed(con, "BSVP:DM:1"):
+        if len(f) >= 2:
+            total += 1
+            pair[(label(f[0].hex()), label(f[1].hex()))] += 1
+    rows = sorted(((s, d, n) for (s, d), n in pair.items()), key=lambda r: -r[2])
+    return rows, total
+
 def games_list(con):
     """Reconstruct games from typed txs. GAME{tableId,gameId}, TBL{tableId,variant,seats,stakes},
     HAND{gameId,handId,button}, BET{handId,...}. The on-chain tableId is always all-zero, so a
@@ -85,10 +106,7 @@ def games_list(con):
     cl = {}                                              # txid -> cluster index
     for i, g in enumerate(comps):
         for t in g: cl[t] = i
-    who = {}                                             # owner pubkey -> pseudonym (game owner = player's Base ID)
-    for r in (identity_saves(con) or []):
-        who[r[4]] = r[6]                                 # idpub  -> pseudonym
-        who.setdefault(r[5], r[6])                       # attpub -> pseudonym (fallback)
+    who = identity_names(con)                            # owner pubkey -> pseudonym (game owner = player's Base ID)
     tables = {}                                          # cluster index -> (variant, seats, stakes)
     for _, _, txid, _, f, _ in iter_typed(con, "BSVP:TBL:1"):
         if len(f) >= 4:
@@ -221,6 +239,16 @@ def main():
             who = "yours" if mine else "other"
             print(f"  {fmt_time(btime):16}  {txid[:12]}  @{(pseudonym or '?')[:15]:15}  "
                   f"{(email or '-')[:24]:24}  {idpub[:16]}… [{who}]")
+
+    print("\n--- DM conversations (BSVP:DM:1) ---")
+    convos, total = conversations(con)
+    if not total:
+        print("  (no DMs)")
+    else:
+        print(f"  total DMs: {total}   distinct senders: {len({s for s, _, _ in convos})}")
+        print(f"  {'msgs':>5}  from → to")
+        for s, d, n in convos:
+            print(f"  {n:>5}  {s} → {d}")
 
     print(f"\n--- timeline (marked txs per {a.buckets}-block bucket) ---")
     for h0, n in q(f"SELECT (height/{a.buckets})*{a.buckets} AS b, count(*) FROM txs GROUP BY b ORDER BY b"):
