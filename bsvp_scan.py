@@ -192,7 +192,7 @@ def cmd_range(a):
     done = {r[0] for r in con.execute("SELECT height FROM blocks")}
     print(f"DB={a.db}  prefixes={len(prefixes)}  range={a.start}..{a.end} ({a.end-a.start+1} blocks)  already_done={len(done)}")
     peer = Peer(a.host, a.port); handshake(peer)
-    # resolve block hashes start..end via the node's getheaders, anchored by WoC hash of (start-1)
+    # resolve block hashes start to end via the node's getheaders, anchored by WoC hash of (start-1)
     cur = bytes.fromhex(woc_hash(a.start - 1))[::-1]; h2h = {}; h = a.start
     while h <= a.end:
         hashes = header_hashes(get_headers(peer, cur))
