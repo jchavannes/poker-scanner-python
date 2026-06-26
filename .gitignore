@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Scanner output
+*.db
+*.db-journal
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
