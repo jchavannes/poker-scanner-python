@@ -14,6 +14,7 @@ MAGIC = bytes.fromhex("e3e1f3e8")          # BSV mainnet message-start
 NEEDLE = b"BSVP:"
 PROTOCOL = 70016
 UA = b"/poker-scanner:0.1/"
+BSVP_GENESIS_HEIGHT = 951000               # conservative start, safely before the first BSVP-Poker tx (first marker seen at 952808)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS blocks(
@@ -188,55 +189,108 @@ def cmd_one(a):
                 print(f"   {txid}  {tg}  {'MINE' if txid[:10] in prefixes else 'other'}")
     peer.close()
 
-def cmd_range(a):
-    prefixes = load_prefixes(a.prefixes)
-    con = sqlite3.connect(a.db); con.executescript(SCHEMA)
-    done = {r[0] for r in con.execute("SELECT height FROM blocks")}
-    print(f"DB={a.db}  prefixes={len(prefixes)}  range={a.start}..{a.end} ({a.end-a.start+1} blocks)  already_done={len(done)}")
-    peer = Peer(a.host, a.port); handshake(peer)
-    # resolve block hashes start to end via the node's getheaders, anchored by WoC hash of (start-1)
-    cur = bytes.fromhex(woc_hash(a.start - 1))[::-1]; h2h = {}; h = a.start
-    while h <= a.end:
+def resolve_hashes(peer, anchor_internal, start, end=None):
+    """Walk getheaders from anchor; return {height: internal_hash} for start..end (end=None → to chain tip)."""
+    h2h = {}; cur = anchor_internal; h = start
+    while end is None or h <= end:
         hashes = header_hashes(get_headers(peer, cur))
         if not hashes: break
         for ih in hashes:
-            if h > a.end: break
+            if end is not None and h > end: break
             h2h[h] = ih; h += 1
         cur = hashes[-1]
-    print(f"resolved {len(h2h)} block hashes via getheaders")
+    return h2h
+
+def scan_hashes(con, peer, host, port, h2h, prefixes, db, rescan=False):
+    """Fetch+scan each block in h2h; print totals. Returns the peer. With rescan=False (the automatic
+    update) heights already in the DB are skipped; with rescan=True every block is re-fetched and
+    re-written (INSERT OR REPLACE), so explicit --from/--range always reprocess."""
+    done = set() if rescan else {r[0] for r in con.execute("SELECT height FROM blocks")}
+    todo = [h for h in sorted(h2h) if h not in done]
     g = {"marked": 0, "mine": 0, "other": 0, "tags": {}}; scanned = bytes_dl = 0; t_start = time.time()
-    for hgt in range(a.start, a.end + 1):
-        if hgt in done: continue
-        ih = h2h.get(hgt)
-        if ih is None: print(f"  !! no hash for {hgt}"); continue
+    for hgt in todo:
+        ih = h2h[hgt]
         try:
             payload = get_block(peer, ih)
         except Exception as e:
             print(f"  !! {hgt} fetch error {e}; reconnecting")
-            peer.close(); peer = Peer(a.host, a.port); handshake(peer); payload = get_block(peer, ih)
+            try:
+                peer.close(); peer = Peer(host, port); handshake(peer); payload = get_block(peer, ih)
+            except Exception as e2:
+                print(f"  !! {hgt} retry failed ({e2}); skipping block"); continue
         bytes_dl += len(payload); scanned += 1
         m, mi, o, tags, ntx = scan_block(payload, hgt, ih[::-1].hex(), prefixes, con)
         g["marked"] += m; g["mine"] += mi; g["other"] += o
         for k, v in tags.items(): g["tags"][k] = g["tags"].get(k, 0) + v
         if m or scanned % 200 == 0:
-            print(f"  [{hgt}] {scanned}/{a.end-a.start+1} done, {bytes_dl/1e6:.0f}MB, {time.time()-t_start:.0f}s"
+            print(f"  [{hgt}] {scanned}/{len(todo)} done, {bytes_dl/1e6:.0f}MB, {time.time()-t_start:.0f}s"
                   + (f"  >>> marked={m} mine={mi} other={o} {tags}" if m else ""), flush=True)
     print("\n==== TOTAL ====")
     print(f"blocks scanned={scanned}  data={bytes_dl/1e6:.0f}MB  time={time.time()-t_start:.0f}s")
     print(f"BSVP-marked txs={g['marked']}  mine(lineage)={g['mine']}  other(non-lineage)={g['other']}")
-    print(f"tag breakdown={g['tags']}\nDB -> {a.db}  (tables: blocks, txs, tx_inputs)")
+    print(f"tag breakdown={g['tags']}\nDB -> {db}  (tables: blocks, txs, tx_inputs)")
+    return peer
+
+def cmd_range(a):
+    if a.start > a.end:
+        print(f"empty range: start {a.start} > end {a.end}"); return
+    prefixes = load_prefixes(a.prefixes)
+    con = sqlite3.connect(a.db); con.executescript(SCHEMA)
+    peer = Peer(a.host, a.port); handshake(peer)
+    anchor = bytes.fromhex(woc_hash(a.start - 1))[::-1]   # one WoC call to anchor the start
+    h2h = resolve_hashes(peer, anchor, a.start, a.end)
+    print(f"DB={a.db}  prefixes={len(prefixes)}  RESCAN range={a.start}..{a.end}  resolved {len(h2h)} hashes")
+    peer = scan_hashes(con, peer, a.host, a.port, h2h, prefixes, a.db, rescan=True)
+    con.close(); peer.close()
+
+def cmd_from(a):
+    """Explicit RESCAN from a height to the chain tip — re-fetches and re-writes every block in range,
+    even ones already in the DB. Also seeds a fresh DB."""
+    prefixes = load_prefixes(a.prefixes)
+    con = sqlite3.connect(a.db); con.executescript(SCHEMA)
+    peer = Peer(a.host, a.port); handshake(peer)
+    anchor = bytes.fromhex(woc_hash(a.from_height - 1))[::-1]
+    h2h = resolve_hashes(peer, anchor, a.from_height, None)
+    print(f"DB={a.db}  RESCAN {a.from_height}..tip  resolved {len(h2h)} blocks")
+    peer = scan_hashes(con, peer, a.host, a.port, h2h, prefixes, a.db, rescan=True)
+    con.close(); peer.close()
+
+def cmd_update(a):
+    """DEFAULT (automatic): stay up to date — scan only NEW blocks, up to the chain tip, skipping anything
+    already in the DB. Once the DB has data it anchors on its own last block hash (no WoC call); a fresh/empty
+    DB bootstraps from BSVP_GENESIS_HEIGHT (where BSVP-Poker activity starts)."""
+    prefixes = load_prefixes(a.prefixes)
+    con = sqlite3.connect(a.db); con.executescript(SCHEMA)
+    row = con.execute("SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1").fetchone()
+    if row:
+        start = row[0] + 1; anchor = bytes.fromhex(row[1])[::-1]
+        print(f"DB={a.db}  last scanned height={row[0]}; checking for new blocks {start}..tip")
+    else:
+        start = BSVP_GENESIS_HEIGHT; anchor = bytes.fromhex(woc_hash(start - 1))[::-1]
+        print(f"DB={a.db}  empty — bootstrapping from BSVP genesis height {start} to tip")
+    peer = Peer(a.host, a.port); handshake(peer)
+    h2h = resolve_hashes(peer, anchor, start, None)
+    if not h2h:
+        print(f"up to date — no new blocks past height {start-1}."); con.close(); peer.close(); return
+    print(f"resolved {len(h2h)} new block(s): {start}..{start+len(h2h)-1}")
+    peer = scan_hashes(con, peer, a.host, a.port, h2h, prefixes, a.db, rescan=False)
     con.close(); peer.close()
 
 def main():
     ap = argparse.ArgumentParser(description="Scan BSV chain for BSV-Poker BSVP: markers")
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8333)
     ap.add_argument("--db", default="bsvp.db"); ap.add_argument("--prefixes", default="/tmp/tx-prefixes.txt")
-    ap.add_argument("--one", type=int, help="fetch+scan a single block height")
-    ap.add_argument("--range", nargs=2, type=int, metavar=("START", "END"))
+    mode = ap.add_mutually_exclusive_group()             # default (none given) = automatic incremental update
+    mode.add_argument("--one", type=int, help="fetch+scan a single block height (prints; no DB write)")
+    mode.add_argument("--range", nargs=2, type=int, metavar=("START", "END"),
+                      help="RESCAN an explicit height range (re-fetches and re-writes, even blocks already in the DB)")
+    mode.add_argument("--from", dest="from_height", type=int,
+                      help="RESCAN from a height to the chain tip (also seeds a fresh DB)")
     a = ap.parse_args()
     if a.one is not None: cmd_one(a)
     elif a.range: a.start, a.end = a.range; cmd_range(a)
-    else: ap.print_help()
+    elif a.from_height is not None: cmd_from(a)
+    else: cmd_update(a)                                   # DEFAULT (automatic): incremental — only new blocks to tip
 
 if __name__ == "__main__":
     main()

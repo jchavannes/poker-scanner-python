@@ -49,8 +49,10 @@ prefer, `source .venv/bin/activate` first and just run `python`.
 
 ```bash
 # scan
-.venv/bin/python bsvp_scan.py --one 953701              # fetch + scan one block
-.venv/bin/python bsvp_scan.py --range 951700 955284     # scan a height window into the DB
+.venv/bin/python bsvp_scan.py                           # DEFAULT (automatic): new blocks → tip; a fresh DB bootstraps from BSVP genesis (951000)
+.venv/bin/python bsvp_scan.py --from 951700             # RESCAN from a height to the tip (re-fetches even blocks already in the DB)
+.venv/bin/python bsvp_scan.py --range 951700 955284     # RESCAN an explicit window (re-fetches even blocks already in the DB)
+.venv/bin/python bsvp_scan.py --one 953701              # fetch + scan a single block (prints; no DB write)
 #   options: --host 127.0.0.1 --port 8333 --db bsvp.db --prefixes /tmp/tx-prefixes.txt
 
 # analyse
